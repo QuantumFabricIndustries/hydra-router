@@ -39,6 +39,16 @@ export function buildChatRouter(hydra: HydraRouter): Router {
 
       let completionTokens = 0;
       let promptTokens = 0;
+      // BUG 1 FIX: track whether any content chunks have been sent to the client.
+      // If a stream failure happens after content has been flushed, we cannot
+      // silently switch to a fallback — that would splice two responses together.
+      let contentChunksSent = 0;
+      // BUG 3 FIX: track the model that actually served the request for accurate pricing.
+      let actualModel = model;
+      let actualModelAlias = modelAlias;
+      let actualRule = decision.rule;
+      // BUG 2 FIX: track whether the response ended in an error.
+      let streamSuccess = false;
 
       try {
         const usage = await adapter.stream(model.model, body, (chunk) => {
@@ -48,6 +58,7 @@ export function buildChatRouter(hydra: HydraRouter): Router {
             return;
           }
 
+          contentChunksSent++;
           const ssePayload = {
             id: requestId,
             object: 'chat.completion.chunk',
@@ -66,46 +77,67 @@ export function buildChatRouter(hydra: HydraRouter): Router {
 
         promptTokens = usage.promptTokens;
         completionTokens = usage.completionTokens;
+        streamSuccess = true;
       } catch (err: unknown) {
-        // Try fallback
-        const fallbackModel = hydra.getFallback(decision);
-        if (fallbackModel) {
-          const fallbackAdapter = getAdapter(fallbackModel.provider);
-          try {
-            const usage = await fallbackAdapter.stream(fallbackModel.model, body, (chunk) => {
-              if (chunk.done) { res.write('data: [DONE]\n\n'); return; }
-              const ssePayload = {
-                id: requestId,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: fallbackModel.model,
-                choices: [{ index: 0, delta: { content: chunk.delta }, finish_reason: null }],
-                hydra: { rule: `${decision.rule}:fallback`, modelAlias: 'fallback' },
-              };
-              res.write(`data: ${JSON.stringify(ssePayload)}\n\n`);
-            });
-            promptTokens = usage.promptTokens;
-            completionTokens = usage.completionTokens;
-          } catch (fallbackErr) {
-            res.write(`data: ${JSON.stringify({ error: (fallbackErr as Error).message })}\n\n`);
-          }
+        // BUG 1 FIX: Only attempt fallback if no content has been sent yet.
+        // If content was already flushed, splicing a fallback response would
+        // corrupt the client's view — send an error event instead.
+        if (contentChunksSent > 0) {
+          // Content already sent — cannot retry cleanly; signal error and close.
+          res.write(`data: ${JSON.stringify({ error: { message: (err as Error).message, type: 'stream_error' } })}\n\n`);
+          res.write('data: [DONE]\n\n');
         } else {
-          res.write(`data: ${JSON.stringify({ error: (err as Error).message })}\n\n`);
+          // No content sent yet — safe to try fallback transparently.
+          const fallbackModel = hydra.getFallback(decision);
+          if (fallbackModel) {
+            const fallbackAdapter = getAdapter(fallbackModel.provider);
+            try {
+              const usage = await fallbackAdapter.stream(fallbackModel.model, body, (chunk) => {
+                if (chunk.done) { res.write('data: [DONE]\n\n'); return; }
+                const ssePayload = {
+                  id: requestId,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: fallbackModel.model,
+                  choices: [{ index: 0, delta: { content: chunk.delta }, finish_reason: null }],
+                  hydra: { rule: `${decision.rule}:fallback`, modelAlias: 'fallback' },
+                };
+                res.write(`data: ${JSON.stringify(ssePayload)}\n\n`);
+              });
+              promptTokens = usage.promptTokens;
+              completionTokens = usage.completionTokens;
+              // BUG 3 FIX: use fallback model for pricing
+              actualModel = fallbackModel;
+              actualModelAlias = 'fallback';
+              actualRule = `${decision.rule}:fallback`;
+              streamSuccess = true;
+            } catch (fallbackErr) {
+              // BUG 2 FIX: send a proper SSE error event and [DONE] before ending
+              res.write(`data: ${JSON.stringify({ error: { message: (fallbackErr as Error).message, type: 'provider_error' } })}\n\n`);
+              res.write('data: [DONE]\n\n');
+            }
+          } else {
+            // BUG 2 FIX: send a proper SSE error event and [DONE] before ending
+            res.write(`data: ${JSON.stringify({ error: { message: (err as Error).message, type: 'provider_error' } })}\n\n`);
+            res.write('data: [DONE]\n\n');
+          }
         }
       }
 
-      const costUSD = tracker.calcCost(model, promptTokens, completionTokens);
+      // BUG 3 FIX: price against the model that actually served the request.
+      // BUG 2 FIX: record accurate success/failure status.
+      const costUSD = tracker.calcCost(actualModel, promptTokens, completionTokens);
       tracker.record({
         requestId,
-        rule: decision.rule,
-        modelAlias,
-        provider: model.provider,
-        model: model.model,
+        rule: actualRule,
+        modelAlias: actualModelAlias,
+        provider: actualModel.provider,
+        model: actualModel.model,
         promptTokens,
         completionTokens,
         costUSD,
         latencyMs: Date.now() - start,
-        success: true,
+        success: streamSuccess,
       });
 
       res.end();
